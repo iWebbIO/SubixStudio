@@ -46,7 +46,7 @@ class AppSettings:
     engine_mode: bool = False
     test_interval_minutes: int = 30
     max_concurrent_tests: int = 10
-    test_timeout_seconds: int = 15
+    test_timeout_seconds: int = 45
     failure_threshold: int = 3
     auto_deduplicate: bool = True
     auto_test_new_configs: bool = True
@@ -515,12 +515,12 @@ class TestRunner:
                     config_map = {}
                     
                     # Parse current batch
-                    for config in batch_configs:
+                    for b_idx, config in enumerate(batch_configs):
                         idx = progress_map[config['id']]
                         try:
                             parsed = parse_uri(config['uri'])
                             if parsed:
-                                unique_tag = f"test_{config['id']}_{int(time.time()*1000)}"
+                                unique_tag = f"test_{config['id']}_{int(time.time()*1000)}_{b_idx}"
                                 
                                 if hasattr(parsed, 'display_tag'): parsed.display_tag = unique_tag
                                 if hasattr(parsed, 'tag'): parsed.tag = unique_tag
@@ -546,9 +546,10 @@ class TestRunner:
                     
                     try:
                         # First pass
+                        # Ensure timeout is sufficient for batch processing
                         results = self.tester.test_uris(
                             parsed_params=parsed_batch,
-                            timeout=settings.test_timeout_seconds
+                            timeout=max(settings.test_timeout_seconds, 45)
                         ) or []
                         
                         success_tags = set()
@@ -572,7 +573,7 @@ class TestRunner:
                             time.sleep(0.5)
                             retry_results = self.tester.test_uris(
                                 parsed_params=retry_batch,
-                                timeout=settings.test_timeout_seconds
+                                timeout=max(settings.test_timeout_seconds, 45)
                             ) or []
                             
                             for result in retry_results:
@@ -609,6 +610,9 @@ class TestRunner:
                                 self.test_progress['configs'][idx]['status'] = 'completed'
                                 self.test_progress['configs'][idx]['result'] = 'error'
                                 self.test_progress['current'] += 1
+                    
+                    # Add delay between batches to ensure system resources (ports) are released
+                    time.sleep(3)
             
             self.test_progress['status'] = 'completed'
         except Exception as e:

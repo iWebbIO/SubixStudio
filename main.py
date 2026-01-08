@@ -34,7 +34,7 @@ try:
     HAS_V2RAY_LIB = True
 except ImportError:
     HAS_V2RAY_LIB = False
-    print("Warning: python_v2ray library not found. Testing features will be simulated.")
+    print("Warning: python_v2ray library not found. Testing features disabled.")
 
 DB_PATH = PROJECT_ROOT / "subix_studio.db"
 VENDOR_PATH = PROJECT_ROOT / "vendor"
@@ -313,6 +313,11 @@ class ConfigManager:
                 WHERE id IN ({placeholders})
             """, tuple(config_ids))
 
+    @staticmethod
+    def retire_working_configs():
+        with db.transaction() as conn:
+            conn.execute("UPDATE configs SET status = 'retired' WHERE status = 'working'")
+
 class SubscriptionManager:
     @staticmethod
     def add_subscription(name: str, url: str) -> Optional[int]:
@@ -443,6 +448,9 @@ class TestRunner:
                 self.tester = None
 
     def test_configs(self, config_ids: List[int] = None, test_type: str = 'connection'):
+        if not self.tester:
+            return {'success': False, 'error': 'Testing disabled: python_v2ray library missing'}
+
         if self.is_testing:
             return {'success': False, 'error': 'Test already in progress'}
         
@@ -450,15 +458,32 @@ class TestRunner:
         threading.Thread(target=self._run_tests, args=(config_ids, test_type), daemon=True).start()
         return {'success': True, 'message': 'Testing started'}
 
+    def stop_tests(self):
+        if self.is_testing:
+            self.is_testing = False
+            return {'success': True, 'message': 'Stopping tests...'}
+        return {'success': False, 'error': 'No test running'}
+
     def _run_tests(self, config_ids: List[int] = None, test_type: str = 'connection'):
         try:
             if config_ids:
                 placeholders = ','.join(['?' for _ in config_ids])
                 configs = db.fetchall(f"SELECT * FROM configs WHERE id IN ({placeholders})", tuple(config_ids))
+                configs = [dict(c) for c in configs]
+                import random
+                random.shuffle(configs)
             else:
-                configs = db.fetchall("SELECT * FROM configs WHERE status != 'retired'")
+                # Prioritize untested configs, then shuffle the rest to distribute load
+                untested = db.fetchall("SELECT * FROM configs WHERE status = 'untested' AND status != 'retired'")
+                others = db.fetchall("SELECT * FROM configs WHERE status != 'untested' AND status != 'retired' ORDER BY last_tested ASC")
+                
+                untested = [dict(c) for c in untested]
+                others = [dict(c) for c in others]
+                
+                import random
+                random.shuffle(others)
+                configs = untested + others
             
-            configs = [dict(c) for c in configs]
             self.test_progress = {
                 'current': 0, 
                 'total': len(configs), 
@@ -473,97 +498,117 @@ class TestRunner:
                 } for c in configs]
             }
             
+            # Create a map for quick index lookup
+            progress_map = {c['id']: i for i, c in enumerate(configs)}
             settings = SettingsManager.get_settings()
             
             if self.tester and HAS_V2RAY_LIB:
-                parsed_configs = []
-                config_map = {}
-                
-                for idx, config in enumerate(configs):
-                    try:
-                        parsed = parse_uri(config['uri'])
-                        if parsed:
-                            parsed_configs.append(parsed)
-                            config_map[parsed.tag if hasattr(parsed, 'tag') else id(parsed)] = (config['id'], idx)
-                    except:
-                        ConfigManager.update_config_status(config['id'], 'failed')
-                        self.test_progress['configs'][idx]['status'] = 'testing'
-                        self.test_progress['configs'][idx]['result'] = 'failed'
-                        self.test_progress['current'] += 1
-                
-                if parsed_configs:
-                    batch_size = settings.max_concurrent_tests
-                    for i in range(0, len(parsed_configs), batch_size):
-                        batch = parsed_configs[i:i+batch_size]
-                        batch_indices = list(range(i, min(i+batch_size, len(parsed_configs))))
-                        
-                        for batch_idx in batch_indices:
-                            if batch_idx < len(self.test_progress['configs']):
-                                self.test_progress['configs'][batch_idx]['status'] = 'testing'
-                        
-                        time.sleep(0.5)
-                        
-                        try:
-                            results = self.tester.test_uris(
-                                parsed_params=batch,
-                                timeout=settings.test_timeout_seconds
-                            )
-                            
-                            for result in results:
-                                tag = result.get('tag', '')
-                                config_data = config_map.get(tag)
-                                if config_data:
-                                    config_id, idx = config_data
-                                    if result.get('status') == 'success':
-                                        ConfigManager.update_config_status(
-                                            config_id, 'working',
-                                            ping_ms=result.get('ping_ms')
-                                        )
-                                        self.test_progress['configs'][idx]['status'] = 'completed'
-                                        self.test_progress['configs'][idx]['result'] = 'success'
-                                        self.test_progress['configs'][idx]['ping'] = result.get('ping_ms')
-                                    else:
-                                        ConfigManager.update_config_status(config_id, 'failed')
-                                        self.test_progress['configs'][idx]['status'] = 'completed'
-                                        self.test_progress['configs'][idx]['result'] = 'failed'
-                                    self.test_progress['current'] += 1
-                        except Exception as e:
-                            print(f"Batch test error: {e}")
-                            for batch_idx in batch_indices:
-                                if batch_idx < len(self.test_progress['configs']):
-                                    self.test_progress['configs'][batch_idx]['status'] = 'completed'
-                                    self.test_progress['configs'][batch_idx]['result'] = 'error'
-                                    self.test_progress['current'] += 1
-            else:
-                import random
-                settings = SettingsManager.get_settings()
                 batch_size = settings.max_concurrent_tests
                 
+                # Process in batches to reduce memory usage and improve responsiveness
                 for i in range(0, len(configs), batch_size):
-                    batch_indices = list(range(i, min(i+batch_size, len(configs))))
+                    if not self.is_testing:
+                        break
+                        
+                    batch_configs = configs[i:i+batch_size]
+                    parsed_batch = []
+                    config_map = {}
                     
-                    for idx in batch_indices:
-                        self.test_progress['configs'][idx]['status'] = 'testing'
-                    
-                    time.sleep(0.5)
-                    
-                    for idx in batch_indices:
-                        config = configs[idx]
-                        time.sleep(0.1)
-                        if random.random() > 0.3:
-                            ping = random.randint(50, 500)
-                            ConfigManager.update_config_status(
-                                config['id'], 'working',
-                                ping_ms=ping
-                            )
-                            self.test_progress['configs'][idx]['status'] = 'completed'
-                            self.test_progress['configs'][idx]['result'] = 'success'
-                            self.test_progress['configs'][idx]['ping'] = ping
-                        else:
+                    # Parse current batch
+                    for config in batch_configs:
+                        idx = progress_map[config['id']]
+                        try:
+                            parsed = parse_uri(config['uri'])
+                            if parsed:
+                                unique_tag = f"test_{config['id']}_{int(time.time()*1000)}"
+                                
+                                if hasattr(parsed, 'display_tag'): parsed.display_tag = unique_tag
+                                if hasattr(parsed, 'tag'): parsed.tag = unique_tag
+                                if hasattr(parsed, 'ps'): parsed.ps = unique_tag
+                                
+                                parsed_batch.append(parsed)
+                                config_map[unique_tag] = (config['id'], idx)
+                            else:
+                                raise Exception("Parse failed")
+                        except:
                             ConfigManager.update_config_status(config['id'], 'failed')
                             self.test_progress['configs'][idx]['status'] = 'completed'
                             self.test_progress['configs'][idx]['result'] = 'failed'
-                        self.test_progress['current'] += 1
+                            self.test_progress['current'] += 1
+                    
+                    if not parsed_batch:
+                        continue
+                        
+                    # Mark as testing
+                    for tag in config_map:
+                        _, idx = config_map[tag]
+                        self.test_progress['configs'][idx]['status'] = 'testing'
+                    
+                    try:
+                        # First pass
+                        results = self.tester.test_uris(
+                            parsed_params=parsed_batch,
+                            timeout=settings.test_timeout_seconds
+                        ) or []
+                        
+                        success_tags = set()
+                        for result in results:
+                            tag = result.get('tag', '')
+                            if result.get('status') == 'success':
+                                success_tags.add(tag)
+                                if tag in config_map:
+                                    cid, idx = config_map[tag]
+                                    ConfigManager.update_config_status(cid, 'working', ping_ms=result.get('ping_ms'))
+                                    self.test_progress['configs'][idx]['status'] = 'completed'
+                                    self.test_progress['configs'][idx]['result'] = 'success'
+                                    self.test_progress['configs'][idx]['ping'] = result.get('ping_ms')
+                                    self.test_progress['current'] += 1
+
+                        # Retry failed items once
+                        retry_batch = [p for p in parsed_batch if 
+                                     (getattr(p, 'display_tag', None) or getattr(p, 'tag', None) or getattr(p, 'ps', None)) not in success_tags]
+                        
+                        if retry_batch:
+                            time.sleep(0.5)
+                            retry_results = self.tester.test_uris(
+                                parsed_params=retry_batch,
+                                timeout=settings.test_timeout_seconds
+                            ) or []
+                            
+                            for result in retry_results:
+                                tag = result.get('tag', '')
+                                if tag in config_map:
+                                    cid, idx = config_map[tag]
+                                    if self.test_progress['configs'][idx]['status'] == 'testing':
+                                        if result.get('status') == 'success':
+                                            ConfigManager.update_config_status(cid, 'working', ping_ms=result.get('ping_ms'))
+                                            self.test_progress['configs'][idx]['status'] = 'completed'
+                                            self.test_progress['configs'][idx]['result'] = 'success'
+                                            self.test_progress['configs'][idx]['ping'] = result.get('ping_ms')
+                                        else:
+                                            ConfigManager.update_config_status(cid, 'failed')
+                                            self.test_progress['configs'][idx]['status'] = 'completed'
+                                            self.test_progress['configs'][idx]['result'] = 'failed'
+                                        self.test_progress['current'] += 1
+                        
+                        # Cleanup stuck items
+                        for tag in config_map:
+                            _, idx = config_map[tag]
+                            if self.test_progress['configs'][idx]['status'] == 'testing':
+                                cid = config_map[tag][0]
+                                ConfigManager.update_config_status(cid, 'failed')
+                                self.test_progress['configs'][idx]['status'] = 'completed'
+                                self.test_progress['configs'][idx]['result'] = 'failed'
+                                self.test_progress['current'] += 1
+                                
+                    except Exception as e:
+                        print(f"Batch test error: {e}")
+                        for tag in config_map:
+                            _, idx = config_map[tag]
+                            if self.test_progress['configs'][idx]['status'] == 'testing':
+                                self.test_progress['configs'][idx]['status'] = 'completed'
+                                self.test_progress['configs'][idx]['result'] = 'error'
+                                self.test_progress['current'] += 1
             
             self.test_progress['status'] = 'completed'
         except Exception as e:
@@ -2021,6 +2066,9 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                         <div class="table-container">
                             <div class="table-header">
                                 <h2>Working Configurations</h2>
+                                <div class="table-actions">
+                                    <button class="btn btn-danger" onclick="retireAllWorking()">Retire All</button>
+                                </div>
                             </div>
                             <div class="table-wrapper">
                                 <table class="data-table">
@@ -2255,6 +2303,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             sortBy: 'id',
             sortOrder: 'desc',
             searchQuery: '',
+            isPolling: false,
             settings: {}
         };
         
@@ -2283,6 +2332,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 content.classList.toggle('active', content.id === 'tab-' + tabId);
             });
             state.selectedConfigs.clear();
+            document.querySelectorAll('.table-header .checkbox').forEach(cb => cb.classList.remove('checked'));
             updateSelectionBar();
             loadData();
         }
@@ -2312,6 +2362,15 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 startTestingMonitor();
             } else if (state.currentTab === 'preferences') {
                 await loadSettings();
+            }
+            
+            // Check global test status to update button
+            const progress = await api('test/progress');
+            if (progress.status === 'testing') {
+                updateTestButton(true);
+                if (!state.isPolling) pollTestProgress();
+            } else {
+                updateTestButton(false);
             }
         }
         
@@ -2657,6 +2716,36 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             showToast('Configs restored', 'success');
         }
         
+        async function retireAllWorking() {
+            if (!confirm('Are you sure you want to retire ALL working configs?')) return;
+            
+            await api('configs/retire_working', 'POST');
+            showToast('All working configs retired', 'success');
+            loadData();
+        }
+        
+        function toggleSelectAll(elementId) {
+            const el = document.getElementById(elementId);
+            const isChecked = el.classList.toggle('checked');
+            
+            state.configs.forEach(c => {
+                if (isChecked) {
+                    state.selectedConfigs.add(c.id);
+                } else {
+                    state.selectedConfigs.delete(c.id);
+                }
+                
+                const row = document.querySelector(`tr[data-id="${c.id}"]`);
+                if (row) {
+                    row.classList.toggle('selected', isChecked);
+                    const cb = row.querySelector('.checkbox');
+                    if (cb) cb.classList.toggle('checked', isChecked);
+                }
+            });
+            
+            updateSelectionBar();
+        }
+        
         function showModal(title, body, footer) {
             document.getElementById('modal-title').textContent = title;
             document.getElementById('modal-body').innerHTML = body;
@@ -2852,18 +2941,44 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             content.scrollTop = scrollTop;
         }
         
-        async function testAllConfigs() {
-            const result = await api('test', 'POST', {});
-            if (result.success) {
-                showToast('Testing all configs...', 'info');
-                switchTab('testing');
-                pollTestProgress();
+        function updateTestButton(isRunning) {
+            const btn = document.getElementById('test-all-btn');
+            if (isRunning) {
+                btn.innerHTML = '■ Stop Test';
+                btn.classList.remove('btn-primary');
+                btn.classList.add('btn-danger');
             } else {
-                showToast(result.error || 'Failed to start test', 'error');
+                btn.innerHTML = '▶ Test All';
+                btn.classList.remove('btn-danger');
+                btn.classList.add('btn-primary');
+            }
+        }
+
+        async function toggleTesting() {
+            const btn = document.getElementById('test-all-btn');
+            const isRunning = btn.classList.contains('btn-danger');
+
+            if (isRunning) {
+                await api('test/stop', 'POST');
+                showToast('Stopping tests...', 'info');
+                updateTestButton(false);
+            } else {
+                const result = await api('test', 'POST', {});
+                if (result.success) {
+                    showToast('Testing started', 'info');
+                    switchTab('testing');
+                    updateTestButton(true);
+                    pollTestProgress();
+                } else {
+                    showToast(result.error || 'Failed to start test', 'error');
+                }
             }
         }
         
         async function pollTestProgress() {
+            if (state.isPolling) return;
+            state.isPolling = true;
+            
             const progressEl = document.getElementById('test-progress');
             progressEl.classList.add('visible');
             
@@ -2879,7 +2994,9 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 if (progress.status === 'testing' && progress.current < progress.total) {
                     setTimeout(poll, 1000);
                 } else {
+                    state.isPolling = false;
                     progressEl.classList.remove('visible');
+                    updateTestButton(false);
                     loadData();
                     if (progress.status === 'completed') {
                         showToast('Testing completed', 'success');
@@ -2942,7 +3059,11 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             });
             
             document.getElementById('refresh-btn').addEventListener('click', loadData);
-            document.getElementById('test-all-btn').addEventListener('click', testAllConfigs);
+            document.getElementById('test-all-btn').addEventListener('click', toggleTesting);
+            
+            document.getElementById('select-all-configs').addEventListener('click', () => toggleSelectAll('select-all-configs'));
+            document.getElementById('select-all-working').addEventListener('click', () => toggleSelectAll('select-all-working'));
+            document.getElementById('select-all-retired').addEventListener('click', () => toggleSelectAll('select-all-retired'));
             
             document.addEventListener('click', hideContextMenu);
             document.addEventListener('keydown', e => {
@@ -3091,10 +3212,19 @@ class RequestHandler(BaseHTTPRequestHandler):
             ConfigManager.restore_configs(ids)
             self.send_json({'success': True})
 
+        elif path == '/api/configs/retire_working':
+            ConfigManager.retire_working_configs()
+            self.send_json({'success': True})
+
         elif path == '/api/test':
             config_ids = body.get('config_ids')
             runner = TestRunner()
             result = runner.test_configs(config_ids)
+            self.send_json(result)
+
+        elif path == '/api/test/stop':
+            runner = TestRunner()
+            result = runner.stop_tests()
             self.send_json(result)
 
         elif path == '/api/settings':
